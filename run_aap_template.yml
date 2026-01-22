@@ -1,0 +1,215 @@
+---
+# Playbook: Run AAP Job Template via SSO
+#
+# This playbook runs an existing job template in Ansible Automation Platform
+# using SSO authentication via environment variables.
+#
+# Prerequisites:
+#   1. Install collections: ansible-galaxy collection install -r requirements.yml
+#   2. Set environment variables:
+#      export AAP_URL="https://your-aap-instance.com"
+#      export AAP_TOKEN="your-oauth-token-here"
+#      export AAP_TEMPLATE_NAME="vSphere-Nested-DEVQE-static-autoscript"
+#      export VC_STATIC_IP="192.168.1.100"  # Optional: passed as vc_static_ip to template
+#      export VC_FACT_PASSWORD="your-password"  # Required
+#      export VERSION="your-version"  # Required
+#      export TARGET_HOSTS="host1 host2"  # Required: Space-separated (text area field)
+#      export TARGET_VCS="vc1,vc2"  # Required
+#      export HOWMANYDAYS="30"  # Required
+#      export VC_STATIC="True"  # Required: Must be exactly "True" or "False" (will be normalized)
+#
+# Usage:
+#   ansible-playbook run_aap_template.yml
+#
+#   Or with custom template:
+#   ansible-playbook run_aap_template.yml -e "template_name=My Template"
+#
+#   Or with additional extra variables:
+#   ansible-playbook run_aap_template.yml \
+#     -e "template_name=My Template" \
+#     -e 'extra_vars_override={"version": "1.2.3"}'
+#
+#   The vc_static_ip variable is automatically read from VC_STATIC_IP
+#   environment variable and passed as an extra variable to the template.
+#   Additional variables can be provided via extra_vars_override.
+
+- name: Run AAP Job Template via SSO
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - awx.awx
+
+  vars:
+    # Read from environment variables with defaults
+    controller_host: "{{ lookup('env', 'AAP_URL') | default('', true) }}"
+    controller_token: "{{ lookup('env', 'AAP_TOKEN') | default('', true) }}"
+    controller_verify_ssl: "{{ lookup('env', 'AAP_VERIFY_SSL') | default('true', true) | bool }}"
+    
+    # Template name - can be overridden via -e flag or environment variable
+    template_name: "{{ lookup('env', 'AAP_TEMPLATE_NAME') | default('', true) }}"
+    
+    # Read required variables from environment variables
+    vc_static_ip: "{{ lookup('env', 'VC_STATIC_IP') | default('', true) }}"
+    vc_fact_password: "{{ lookup('env', 'VC_FACT_PASSWORD') | default('', true) }}"
+    version: "{{ lookup('env', 'VERSION') | default('', true) }}"
+    target_hosts_raw: "{{ lookup('env', 'TARGET_HOSTS') | default('', true) }}"
+    target_vcs: "{{ lookup('env', 'TARGET_VCS') | default('', true) }}"
+    howmanydays: "{{ lookup('env', 'HOWMANYDAYS') | default('', true) }}"
+    vc_static_raw: "{{ lookup('env', 'VC_STATIC') | default('', true) }}"
+    
+    # Optional: Additional extra variables (can be overridden via -e flag)
+    extra_vars_override: {}
+    
+    # Optional: Wait for job completion (default: true)
+    wait_for_completion: true
+    
+    # Optional: Job timeout in seconds (default: 3600)
+    job_timeout: 3600
+    
+    # Optional: Verbosity level 0-4 (default: 0)
+    verbosity: 0
+
+  tasks:
+    - name: Normalize vc_static to "True" or "False" as string
+      set_fact:
+        vc_static: "{{ ('True' if (vc_static_raw | default('') | lower | trim) in ['true', '1', 'yes', 'y'] else 'False') | string }}"
+
+    - name: Debug vc_static value
+      debug:
+        msg:
+          - "vc_static_raw: '{{ vc_static_raw }}'"
+          - "vc_static: '{{ vc_static }}'"
+          - "vc_static type: {{ vc_static | type_debug }}"
+          - "vc_static == 'True': {{ vc_static == 'True' }}"
+          - "vc_static in ['True', 'False']: {{ vc_static in ['True', 'False'] }}"
+
+    - name: Validate vc_static value
+      assert:
+        that:
+          - vc_static is defined
+          - (vc_static | string) in ["True", "False"]
+        fail_msg: "VC_STATIC must normalize to 'True' or 'False'. Got: '{{ vc_static | default('undefined') }}' (type: {{ vc_static | type_debug }})"
+        quiet: true
+
+    - name: Validate required environment variables
+      assert:
+        that:
+          - controller_host != ""
+          - controller_token != ""
+          - template_name != ""
+          - vc_fact_password != ""
+          - version != ""
+          - target_hosts_raw != ""
+          - target_vcs != ""
+          - howmanydays != ""
+          - vc_static_raw != ""
+          - vc_static is defined
+        fail_msg: |
+          Missing or invalid required environment variables:
+          - AAP_URL: {{ controller_host if controller_host else "NOT SET" }}
+          - AAP_TOKEN: {{ "SET" if controller_token else "NOT SET" }}
+          - AAP_TEMPLATE_NAME or template_name: {{ template_name if template_name else "NOT SET" }}
+          - VC_FACT_PASSWORD: {{ "SET" if vc_fact_password else "NOT SET" }}
+          - VERSION: {{ version if version else "NOT SET" }}
+          - TARGET_HOSTS: {{ target_hosts_raw if target_hosts_raw else "NOT SET" }}
+          - TARGET_VCS: {{ target_vcs if target_vcs else "NOT SET" }}
+          - HOWMANYDAYS: {{ howmanydays if howmanydays else "NOT SET" }}
+          - VC_STATIC: {{ vc_static_raw if vc_static_raw else "NOT SET" }} (normalized to: {{ vc_static | default('NOT NORMALIZED') }})
+          
+          Set them with:
+            export AAP_URL="https://your-aap-instance.com"
+            export AAP_TOKEN="your-token-here"
+            export AAP_TEMPLATE_NAME="vSphere-Nested-DEVQE-static-autoscript"
+            export VC_FACT_PASSWORD="your-password"
+            export VERSION="your-version"
+            export TARGET_HOSTS="host1 host2"  # Space or comma-separated (will be converted to newline-separated)
+            export TARGET_VCS="vc1,vc2"
+            export HOWMANYDAYS="30"
+            export VC_STATIC="True"  # Can be True, true, False, false, 1, 0, yes, no (will be normalized)
+            export VC_STATIC_IP="10.185.104.20"  # Optional
+        quiet: true
+
+    - name: Convert target_hosts to newline-separated format
+      set_fact:
+        target_hosts: "{{ target_hosts_raw | replace(',', ' ') | split(' ') | select('string') | select('ne', '') | list | join('\n') }}"
+
+    - name: Build extra_vars dictionary with explicit string conversion
+      set_fact:
+        extra_vars: "{{ {
+          'vc_fact_password': vc_fact_password | string,
+          'version': version | string,
+          'target_hosts': target_hosts | string,
+          'target_vcs': target_vcs | string,
+          'howmanydays': howmanydays | string,
+          'vc_static': vc_static | string
+        } | combine({('vc_static_ip'): vc_static_ip | string} if vc_static_ip != '' else {}) | combine(extra_vars_override | default({})) }}"
+
+    - name: Display configuration
+      debug:
+        msg:
+          - "AAP URL: {{ controller_host }}"
+          - "Template: {{ template_name }}"
+          - "VC Static IP: {{ vc_static_ip if vc_static_ip != '' else 'not set' }}"
+          - "VC Fact Password: {{ 'SET' if vc_fact_password != '' else 'not set' }}"
+          - "Version: {{ version if version != '' else 'not set' }}"
+          - "Target Hosts: {{ target_hosts_raw if target_hosts_raw != '' else 'not set' }} (will be converted to newline-separated)"
+          - "Target VCs: {{ target_vcs if target_vcs != '' else 'not set' }}"
+          - "How Many Days: {{ howmanydays if howmanydays != '' else 'not set' }}"
+          - "VC Static: {{ vc_static if vc_static != '' else 'not set' }} (normalized from: {{ vc_static_raw }})"
+          - "Extra Variables: {{ extra_vars }}"
+          - "VC Static value in extra_vars: '{{ extra_vars.vc_static }}' (type: {{ extra_vars.vc_static | type_debug }})"
+          - "Wait for completion: {{ wait_for_completion }}"
+          - "Timeout: {{ job_timeout }} seconds"
+
+    - name: Ensure vc_static is a string in extra_vars
+      set_fact:
+        extra_vars: "{{ extra_vars | combine({'vc_static': extra_vars.vc_static | string}) }}"
+
+    - name: Display template launch message
+      debug:
+        msg:
+          - "=========================================="
+          - "Launching Job Template: {{ template_name }}"
+          - "=========================================="
+
+    - name: Launch job template
+      awx.awx.job_launch:
+        job_template: "{{ template_name }}"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_token }}"
+        validate_certs: "{{ controller_verify_ssl }}"
+        extra_vars: "{{ extra_vars }}"
+        verbosity: "{{ verbosity }}"
+        wait: "{{ wait_for_completion }}"
+        timeout: "{{ job_timeout }}"
+      register: job_result
+
+    - name: Display job results
+      debug:
+        msg:
+          - "=========================================="
+          - "Job Execution Results"
+          - "=========================================="
+          - "Job ID: {{ job_result.id }}"
+          - "Job Name: {{ job_result.name | default('N/A') }}"
+          - "Status: {{ job_result.status }}"
+          - "Started: {{ job_result.started | default('N/A') }}"
+          - "Finished: {{ job_result.finished | default('N/A') }}"
+          - "Elapsed: {{ job_result.elapsed | default('N/A') }} seconds"
+          - "Job URL: {{ controller_host }}/#/jobs/{{ job_result.id }}"
+          - "=========================================="
+
+    - name: Display job output (if available)
+      debug:
+        var: job_result.stdout_lines
+      when:
+        - wait_for_completion | bool
+        - job_result.stdout_lines is defined
+        - job_result.stdout_lines | length > 0
+
+    - name: Fail if job was not successful
+      fail:
+        msg: "Job {{ job_result.id }} completed with status: {{ job_result.status }}"
+      when:
+        - wait_for_completion | bool
+        - job_result.status not in ["successful", "running"]

@@ -1,0 +1,397 @@
+---
+# Playbook: Migrate Host Between vCenter Datacenters and Clusters
+#
+# This playbook:
+# 1. Connects to vCenter using VC_STATIC_IP
+# 2. Queries source cluster to find first host
+# 3. Puts the discovered host into maintenance mode
+# 4. Removes host from distributed switch 'dvSwitch-nested' (disconnects from DVS)
+# 5. Removes host from source cluster 'nested-devqecluster-1' (removes from vCenter)
+# 6. Creates new datacenter 'nested-devqedatacenter-2' (if needed)
+# 7. Creates new cluster 'nested-devqecluster-2' (if needed)
+# 8. Adds host to target cluster 'nested-devqecluster-2' (re-adds to vCenter)
+# 9. Creates DVS 'dvSwitch-nested2' in target datacenter (if needed)
+# 10. Adds host to DVS 'dvSwitch-nested2' with vmnic1
+# 11. Creates portgroup 'devqe-922' on DVS 'dvSwitch-nested2'
+# 12. Takes host out of maintenance mode
+#
+# Prerequisites:
+#   1. Install collections: ansible-galaxy collection install -r requirements.yml
+#   2. Set environment variables (from setup_env.sh):
+#      export VC_FACT_PASSWORD="your-password"
+#      export VC_STATIC_IP="vcenter-ip-or-hostname"  # Used for vCenter connection
+#
+# Note: The playbook will automatically discover the first host in the source cluster
+#       (nested-devqecluster-1) and use it for migration.
+#
+# Usage:
+#   ansible-playbook playbooks/migrate_host_vcenter.yml
+
+- name: Migrate Host Between vCenter Datacenters and Clusters
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - community.vmware
+    - vmware.vmware
+    - community.general
+
+  vars:
+    # Read from environment variables
+    vc_fact_password: "{{ lookup('env', 'VC_FACT_PASSWORD') | default('', true) }}"
+    vc_static_ip: "{{ lookup('env', 'VC_STATIC_IP') | default('', true) }}"
+    
+    # vCenter connection details
+    vcenter_hostname: "{{ vc_static_ip }}"
+    vcenter_username: "administrator@vsphere.local"
+    vcenter_password: "{{ vc_fact_password }}"
+    
+    # ESXi host credentials
+    esxi_username: "root"
+    esxi_password: "{{ vc_fact_password }}"
+    
+    # Target configuration
+    source_datacenter: "nested-devqedatacenter-1"
+    source_cluster: "nested-devqecluster-1"
+    source_dvswitch: "dvSwitch-nested"
+    target_datacenter: "nested-devqedatacenter-2"
+    target_cluster: "nested-devqecluster-2"
+    target_dvswitch: "dvSwitch-nested2"
+    target_vmnic: "vmnic1"
+    target_uplink: "Uplink 1"
+    
+    # Host will be discovered from vCenter
+    target_host: ""
+    vcenter_server: ""
+    
+    # Wait settings
+    wait_for_completion: true
+    wait_timeout: 3600
+
+  tasks:
+    - name: Validate required variables
+      assert:
+        that:
+          - vc_fact_password != ""
+          - vc_static_ip != ""
+        fail_msg: |
+          Missing required environment variables:
+          - VC_FACT_PASSWORD: {{ "SET" if vc_fact_password else "NOT SET" }}
+          - VC_STATIC_IP: {{ vc_static_ip if vc_static_ip else "NOT SET" }}
+        quiet: true
+
+    - name: Set vCenter server
+      set_fact:
+        vcenter_server: "{{ vc_static_ip }}"
+
+    - name: Disable HA in source cluster
+      vmware.vmware.cluster_ha:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter: "{{ source_datacenter }}"
+        cluster: "{{ source_cluster }}"
+        enable: false
+        validate_certs: false
+      register: ha_disable_result
+
+    - name: Display HA disable result
+      debug:
+        msg: "HA disabled in cluster {{ source_cluster }}"
+
+    - name: Disable DRS in source cluster
+      vmware.vmware.cluster_drs:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter_name: "{{ source_datacenter }}"
+        cluster_name: "{{ source_cluster }}"
+        enable: false
+        validate_certs: false
+      register: drs_disable_result
+
+    - name: Display DRS disable result
+      debug:
+        msg: "DRS disabled in cluster {{ source_cluster }}"
+
+    - name: Query vCenter for hosts in source cluster
+      vmware.vmware.cluster_info:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter_name: "{{ source_datacenter }}"
+        cluster_name: "{{ source_cluster }}"
+        validate_certs: false
+      register: cluster_info
+
+    - name: Extract hosts from cluster info
+      set_fact:
+        cluster_hosts: "{{ cluster_info.clusters[source_cluster].hosts | default([]) }}"
+
+    - name: Display found hosts in cluster
+      debug:
+        msg:
+          - "Found {{ cluster_hosts | length }} host(s) in cluster {{ source_cluster }}"
+          - "Hosts: {{ cluster_hosts | map(attribute='name') | list }}"
+
+    - name: Validate hosts found in cluster
+      assert:
+        that:
+          - cluster_hosts | length > 0
+        fail_msg: "No hosts found in cluster {{ source_cluster }} in datacenter {{ source_datacenter }}"
+        quiet: true
+
+    - name: Set target host from first host in cluster
+      set_fact:
+        target_host: "{{ cluster_hosts[0].name }}"
+
+    - name: Display migration plan
+      debug:
+        msg:
+          - "=========================================="
+          - "vCenter Host Migration Plan"
+          - "=========================================="
+          - "vCenter Server (from VC_STATIC_IP): {{ vcenter_server }}"
+          - "Target Host (discovered from cluster): {{ target_host }}"
+          - "Source Datacenter: {{ source_datacenter }}"
+          - "Source Cluster: {{ source_cluster }}"
+          - "Source DVS: {{ source_dvswitch }}"
+          - "Target Datacenter: {{ target_datacenter }}"
+          - "Target Cluster: {{ target_cluster }}"
+          - "=========================================="
+
+    - name: Connect to vCenter and put host in maintenance mode
+      vmware.vmware.esxi_maintenance_mode:
+        esxi_host_name: "{{ target_host }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        enable_maintenance_mode: true
+        validate_certs: false
+      register: maintenance_result
+
+    - name: Display maintenance mode result
+      debug:
+        msg: "Host {{ target_host }} is now in maintenance mode"
+
+    - name: Move host from distributed switch (disconnect from DVS)
+      community.vmware.vmware_dvs_host:
+        hostname: "{{ vcenter_server }}"
+        esxi_hostname: "{{ target_host }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        switch_name: "{{ source_dvswitch }}"
+        state: absent
+        validate_certs: false
+      register: dvs_move_result
+
+    - name: Display DVS move result
+      debug:
+        msg: "Host {{ target_host }} disconnected from {{ source_dvswitch }}"
+
+    - name: Remove host from source cluster (removes from vCenter)
+      vmware.vmware.esxi_host:
+        esxi_host_name: "{{ target_host }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter: "{{ source_datacenter }}"
+        cluster: "{{ source_cluster }}"
+        state: absent
+        validate_certs: false
+      register: cluster_remove_result
+
+    - name: Display cluster removal result
+      debug:
+        msg: "Host {{ target_host }} removed from cluster {{ source_cluster }} and vCenter"
+
+    - name: Display cluster removal details
+      debug:
+        var: cluster_remove_result
+
+    - name: Wait for cluster removal to complete
+      pause:
+        seconds: 5
+      when: wait_for_completion | bool
+
+
+    - name: Check if target datacenter exists
+      community.vmware.vmware_datacenter:
+        datacenter_name: "{{ target_datacenter }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        state: present
+        validate_certs: false
+      register: datacenter_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create target datacenter if it doesn't exist
+      community.vmware.vmware_datacenter:
+        datacenter_name: "{{ target_datacenter }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        state: present
+        validate_certs: false
+      when: datacenter_check is failed or datacenter_check.datacenter_name is not defined
+      register: datacenter_create_result
+
+    - name: Display datacenter creation result
+      debug:
+        msg: "Datacenter {{ target_datacenter }} exists or was created"
+
+    - name: Check if target cluster exists
+      vmware.vmware.cluster:
+        cluster_name: "{{ target_cluster }}"
+        datacenter_name: "{{ target_datacenter }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        state: present
+        validate_certs: false
+      register: cluster_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create target cluster if it doesn't exist
+      vmware.vmware.cluster:
+        cluster_name: "{{ target_cluster }}"
+        datacenter_name: "{{ target_datacenter }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        state: present
+        validate_certs: false
+      when: cluster_check is failed or cluster_check.cluster_name is not defined
+      register: cluster_create_result
+
+    - name: Display cluster creation result
+      debug:
+        msg: "Cluster {{ target_cluster }} exists or was created"
+
+    - name: Add host to target cluster (re-adds to vCenter)
+      vmware.vmware.esxi_host:
+        esxi_host_name: "{{ target_host }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        esxi_username: "{{ esxi_username }}"
+        esxi_password: "{{ esxi_password }}"
+        datacenter: "{{ target_datacenter }}"
+        cluster: "{{ target_cluster }}"
+        state: present
+        validate_certs: false
+      register: target_cluster_add
+
+    - name: Display target cluster add result
+      debug:
+        msg: "Host {{ target_host }} added to cluster {{ target_cluster }} in datacenter {{ target_datacenter }}"
+
+    - name: Display target cluster add details
+      debug:
+        var: target_cluster_add
+
+    - name: Wait for host addition to complete
+      pause:
+        seconds: 10
+      when: wait_for_completion | bool
+
+    - name: Check if target DVS exists
+      community.vmware.vmware_dvswitch:
+        datacenter: "{{ target_datacenter }}"
+        switch: "{{ target_dvswitch }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        version: "7.0.0"
+        state: present
+        validate_certs: false
+      register: dvs_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create target DVS if it doesn't exist
+      community.vmware.vmware_dvswitch:
+        datacenter: "{{ target_datacenter }}"
+        switch: "{{ target_dvswitch }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        version: "7.0.0"
+        uplink_quantity: 2
+        uplink_prefix: "Uplink "
+        state: present
+        validate_certs: false
+      when: dvs_check is failed or dvs_check.switch is not defined
+      register: dvs_create_result
+
+    - name: Display DVS creation result
+      debug:
+        msg: "DVS {{ target_dvswitch }} exists or was created in datacenter {{ target_datacenter }}"
+
+    - name: Add host to target DVS with vmnic1 assigned to Uplink 1
+      community.vmware.vmware_dvs_host:
+        hostname: "{{ vcenter_server }}"
+        esxi_hostname: "{{ target_host }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        switch_name: "{{ target_dvswitch }}"
+        vmnics:
+          - "{{ target_vmnic }}"
+        state: present
+        validate_certs: false
+      register: dvs_host_add_result
+
+    - name: Display DVS host addition result
+      debug:
+        msg: "Host {{ target_host }} added to DVS {{ target_dvswitch }} with {{ target_vmnic }} (will be assigned to {{ target_uplink }})"
+
+    - name: Display DVS host addition details
+      debug:
+        var: dvs_host_add_result
+
+    - name: Create portgroup 'devqe-922' on target DVS
+      community.vmware.vmware_dvs_portgroup:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        switch_name: "{{ target_dvswitch }}"
+        portgroup_name: "devqe-922"
+        port_binding: static
+        vlan_id: 0
+        num_ports: 128
+        state: present
+        validate_certs: false
+      register: portgroup_create_result
+
+    - name: Display portgroup creation result
+      debug:
+        msg: "Portgroup 'devqe-922' created on DVS {{ target_dvswitch }}"
+
+    - name: Take host out of maintenance mode
+      vmware.vmware.esxi_maintenance_mode:
+        esxi_host_name: "{{ target_host }}"
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        enable_maintenance_mode: false
+        validate_certs: false
+      register: maintenance_exit_result
+
+    - name: Display maintenance mode exit result
+      debug:
+        msg: "Host {{ target_host }} is now out of maintenance mode"
+
+    - name: Display migration summary
+      debug:
+        msg:
+          - "=========================================="
+          - "Migration Completed Successfully"
+          - "=========================================="
+          - "Host: {{ target_host }}"
+          - "Final Location:"
+          - "  Datacenter: {{ target_datacenter }}"
+          - "  Cluster: {{ target_cluster }}"
+          - "  Maintenance Mode: Exited"
+          - "=========================================="

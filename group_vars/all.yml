@@ -1,0 +1,15 @@
+---
+# Group variables for AAP operations
+# Override these values or use environment variables
+
+# AAP Controller Configuration
+controller_host: "{{ lookup('env', 'AAP_URL') | default('https://your-aap-instance.com', true) }}"
+controller_token: "{{ lookup('env', 'AAP_TOKEN') | default('', true) }}"
+controller_username: "{{ lookup('env', 'AAP_USERNAME') | default('', true) }}"
+controller_password: "{{ lookup('env', 'AAP_PASSWORD') | default('', true) }}"
+controller_verify_ssl: "{{ lookup('env', 'AAP_VERIFY_SSL') | default('true', true) | bool }}"
+
+# Job Template Defaults
+default_wait: true
+default_timeout: 3600
+default_verbosity: 0

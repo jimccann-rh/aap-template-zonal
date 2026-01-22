@@ -1,0 +1,23 @@
+---
+# AAP Connection Configuration
+# This inventory defines the AAP controller connection details
+# You can override these with environment variables or group_vars
+
+all:
+  vars:
+    # AAP Controller connection details
+    controller_host: "https://your-aap-instance.com"
+    controller_username: "your-username"
+    controller_password: "your-password"
+    controller_token: "your-oauth-token-here"  # Preferred for SSO users
+    controller_verify_ssl: true
+    
+    # Default job template settings
+    default_inventory: "Production Inventory"
+    default_verbosity: 0
+    default_wait: true
+    default_timeout: 3600
+
+  hosts:
+    localhost:
+      ansible_connection: local
